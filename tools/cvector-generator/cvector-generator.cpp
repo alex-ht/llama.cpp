@@ -54,64 +54,123 @@ static void print_usage(int, char ** argv) {
 //////////////////////////////////////////////////
 
 
+static int parse_l_out_layer(const char * name) {
+    int il = -1;
+    if (name && sscanf(name, "l_out-%d", &il) == 1) {
+        return il;
+    }
+    return -1;
+}
+
 // cb_eval is reused for each pair of positive - negative prompt
 struct callback_data {
-    ggml_context * ctx_ggml = nullptr;   // holds v_pos, v_neg, v_diff_filtered
+    ggml_context * ctx_ggml = nullptr;
 
     int n_layers = 0;
-    int n_tokens = 0;
     bool is_eval_pos = true;
 
-    // each element of the vector correspond to one layer
-    std::vector<struct ggml_tensor *> v_pos; // vector of matrices of size [n_embd, n_tokens]
-    std::vector<struct ggml_tensor *> v_neg; // vector of matrices of size [n_embd, n_tokens]
-    std::vector<struct ggml_tensor *> v_diff_filtered;   // vector of matrices of size [n_embd, n_nonzero_rows]. NOTE: n_nonzero_rows maybe different for each layer
+    // one entry per layer il in [0, n_layers - 2]; rows are concatenated across ubatches
+    std::vector<struct ggml_tensor *> layers_pos;
+    std::vector<struct ggml_tensor *> layers_neg;
+    std::vector<struct ggml_tensor *> v_diff_filtered; // [n_embd, n_nonzero_rows] per layer
 
-    // save a tensor into either v_pos or v_neg (decided by is_eval_pos)
-    void save_tensor_for_layer(struct ggml_tensor * t) {
-        GGML_ASSERT(t->type == GGML_TYPE_F32);
-
-        if (ctx_ggml == nullptr) {
-            // alloc a new ctx_ggml if needed
-            struct ggml_init_params params_ggml = {
-                /*.mem_size   =*/ ggml_tensor_overhead() * n_layers * 3u,
-                /*.mem_buffer =*/ NULL,
-                /*.no_alloc   =*/ true,
-            };
-            ctx_ggml = ggml_init(params_ggml);
+    void init_ctx_ggml() {
+        if (ctx_ggml != nullptr) {
+            return;
         }
 
-        // copy tensor data
-        auto n_bytes = ggml_nbytes(t);
-        struct ggml_tensor * t_layer = ggml_new_tensor_2d(ctx_ggml, t->type, t->ne[0], t->ne[1]);
-        t_layer->data = malloc(n_bytes); // TODO @ngxson : get rid of this malloc somehow
-        ggml_backend_tensor_get(t, t_layer->data, 0, n_bytes);
-        ggml_set_name(t_layer, ggml_get_name(t));
-        //print_debug_tensor(t_layer);
+        const size_t n = (size_t) std::max(0, n_layers - 1);
+        struct ggml_init_params params_ggml = {
+            /*.mem_size   =*/ ggml_tensor_overhead() * n * 8u,
+            /*.mem_buffer =*/ NULL,
+            /*.no_alloc   =*/ true,
+        };
+        ctx_ggml = ggml_init(params_ggml);
+    }
 
-        if (is_eval_pos) {
-            v_pos.push_back(t_layer);
-        } else {
-            v_neg.push_back(t_layer);
+    void ensure_layers() {
+        const int n = std::max(0, n_layers - 1);
+        if ((int) layers_pos.size() != n) {
+            layers_pos.assign(n, nullptr);
+            layers_neg.assign(n, nullptr);
         }
     }
 
-    // calculate diff (v_pos - v_neg) and place the result back to v_pos
+    static struct ggml_tensor * copy_tensor(ggml_context * ctx, struct ggml_tensor * t) {
+        GGML_ASSERT(t->type == GGML_TYPE_F32);
+
+        const size_t n_bytes = ggml_nbytes(t);
+        struct ggml_tensor * dst = ggml_new_tensor_2d(ctx, t->type, t->ne[0], t->ne[1]);
+        dst->data = malloc(n_bytes); // TODO @ngxson : get rid of this malloc somehow
+        ggml_backend_tensor_get(t, dst->data, 0, n_bytes);
+        ggml_set_name(dst, ggml_get_name(t));
+        return dst;
+    }
+
+    static struct ggml_tensor * concat_rows(
+            ggml_context * ctx, struct ggml_tensor * a, struct ggml_tensor * b) {
+        GGML_ASSERT(a->ne[0] == b->ne[0]);
+
+        const int64_t n_embd = a->ne[0];
+        const int64_t n_rows = a->ne[1] + b->ne[1];
+        struct ggml_tensor * dst = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_rows);
+        dst->data = malloc(ggml_nbytes(dst));
+        ggml_set_name(dst, a->name);
+        memcpy(dst->data, a->data, ggml_nbytes(a));
+        memcpy((uint8_t *) dst->data + ggml_nbytes(a), b->data, ggml_nbytes(b));
+        return dst;
+    }
+
+    void save_l_out(int il, struct ggml_tensor * t) {
+        GGML_ASSERT(il >= 0 && il < n_layers - 1);
+
+        init_ctx_ggml();
+        ensure_layers();
+
+        struct ggml_tensor * t_chunk = copy_tensor(ctx_ggml, t);
+        std::vector<struct ggml_tensor *> & layers = is_eval_pos ? layers_pos : layers_neg;
+
+        if (layers[il] == nullptr) {
+            layers[il] = t_chunk;
+            return;
+        }
+
+        struct ggml_tensor * t_cat = concat_rows(ctx_ggml, layers[il], t_chunk);
+        free(layers[il]->data);
+        free(t_chunk->data);
+        layers[il] = t_cat;
+    }
+
+    // calculate diff (layers_pos - layers_neg) in-place on layers_pos
     // all zero rows in the diff tensor will also be removed
     // NOTE: final layer is ignored. we only have (n_layers - 1) to process
     std::vector<struct ggml_tensor *> calc_diff() {
-        for (float il = 0; il < v_pos.size(); il++) {
-            float * a = (float *) v_pos[il]->data;
-            float * b = (float *) v_neg[il]->data;
-            size_t n_elem = ggml_nelements(v_pos[il]);
-            for (size_t j = 0; j < n_elem; j++) {
+        const int n = std::max(0, n_layers - 1);
+        v_diff_filtered.clear();
+
+        for (int il = 0; il < n; ++il) {
+            if (!layers_pos[il] || !layers_neg[il]) {
+                fprintf(stderr, "%s: missing hidden state for layer %d (pos=%s, neg=%s)\n", __func__, il,
+                    layers_pos[il] ? "ok" : "null", layers_neg[il] ? "ok" : "null");
+                return {};
+            }
+
+            struct ggml_tensor * t_pos = layers_pos[il];
+            struct ggml_tensor * t_neg = layers_neg[il];
+            GGML_ASSERT(t_pos->ne[0] == t_neg->ne[0]);
+            GGML_ASSERT(t_pos->ne[1] == t_neg->ne[1]);
+
+            float * a = (float *) t_pos->data;
+            float * b = (float *) t_neg->data;
+            const size_t n_elem = ggml_nelements(t_pos);
+            for (size_t j = 0; j < n_elem; ++j) {
                 a[j] -= b[j];
             }
-            //print_debug_tensor(v_pos[i]);
-            auto diff_filtered = filter_nonzero_rows(v_pos[il]);
+
+            auto diff_filtered = filter_nonzero_rows(t_pos);
             v_diff_filtered.push_back(diff_filtered);
         }
-        return v_diff_filtered; // for convenient, we return the result std::vector
+        return v_diff_filtered;
     }
 
     // delete zero rows from a given 2D tensor
@@ -162,11 +221,20 @@ struct callback_data {
 
     // we don't implement destructor, because we want to reuse callback_data. we just want to free the tensors
     void reset() {
-        for (auto ptr : v_pos) free(ptr->data);
-        for (auto ptr : v_neg) free(ptr->data);
-        for (auto ptr : v_diff_filtered) free(ptr->data);
-        v_pos.clear();
-        v_neg.clear();
+        auto free_layers = [](std::vector<struct ggml_tensor *> & layers) {
+            for (auto ptr : layers) {
+                if (ptr) {
+                    free(ptr->data);
+                }
+            }
+            layers.clear();
+        };
+
+        free_layers(layers_pos);
+        free_layers(layers_neg);
+        for (auto ptr : v_diff_filtered) {
+            free(ptr->data);
+        }
         v_diff_filtered.clear();
         if (ctx_ggml) {
             ggml_free(ctx_ggml);
@@ -335,12 +403,16 @@ static bool cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
         return is_l_out;
     }
 
-    if (!is_l_out || t->ne[1] != cb_data->n_tokens) {
+    if (!is_l_out) {
         return true;
     }
 
-    // save the tensor to current context
-    cb_data->save_tensor_for_layer(t);
+    const int il = parse_l_out_layer(t->name);
+    if (il < 0 || il >= cb_data->n_layers - 1) {
+        return true;
+    }
+
+    cb_data->save_l_out(il, t);
     return true;
 }
 
@@ -460,7 +532,6 @@ int main(int argc, char ** argv) {
         bool success = false;
         tokenized_prompt t = tokenized_prompts[i];
         cb_data.n_layers = n_layers;
-        cb_data.n_tokens = t.max_seq_len;
 
         printf("Evaluating prompt[%d/%d]: \"%s\" - \"%s\" (%d tokens)\n",
             (int) i+1, (int) ctx_train.positive_entries.size(),
@@ -478,6 +549,10 @@ int main(int argc, char ** argv) {
 
         // calculate diff and remove all zero rows
         auto v_diff_filtered = cb_data.calc_diff();
+        if ((int) v_diff_filtered.size() != n_layers - 1) {
+            fprintf(stderr, "error: expected %d layer diffs, got %zu\n", n_layers - 1, v_diff_filtered.size());
+            return 1;
+        }
 
         // save & concat the filtered v_diff to ctx_train
         ctx_train.concat_diff_tmp(v_diff_filtered);
